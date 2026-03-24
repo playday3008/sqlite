@@ -52,16 +52,16 @@
 **
 ** Compressed blob wire format:
 **
-**   Bytes 0-1:  Magic bytes 0x1A 0x5D
-**   Byte 2:     Original SQLite type (1=INT, 2=FLOAT, 3=TEXT, 4=BLOB)
-**   Byte 3:     Flags (bit 0: dictionary was used)
-**   Bytes 4-7:  Uncompressed size, little-endian uint32
-**   Bytes 8+:   Zstd compressed data
+**   Bytes 0-3:  Magic bytes 0x5A 0x43 0x01 0x00 ("ZC" + version 1)
+**   Byte 4:     Original SQLite type (1=INT, 2=FLOAT, 3=TEXT, 4=BLOB)
+**   Byte 5:     Flags (bit 0: dictionary was used)
+**   Bytes 6-9:  Uncompressed size, little-endian uint32
+**   Bytes 10+:  Zstd compressed data
 **
 **   Passthrough (compression didn't help):
-**   Bytes 0-1:  Magic bytes 0x1A 0x5D
-**   Byte 2:     Original type | 0x80
-**   Bytes 3+:   Original data unchanged
+**   Bytes 0-3:  Magic bytes 0x5A 0x43 0x01 0x00
+**   Byte 4:     Original type | 0x80
+**   Bytes 5+:   Original data unchanged
 */
 
 /*
@@ -80,15 +80,17 @@ SQLITE_EXTENSION_INIT1
 #include <stdarg.h>
 #include <assert.h>
 
-/* Magic bytes identifying a zstdcol compressed blob */
-#define ZSTDCOL_MAGIC1     0x1A
-#define ZSTDCOL_MAGIC2     0x5D
+/* 4-byte magic identifying a zstdcol compressed blob: "ZC" + version + 0x00 */
+#define ZSTDCOL_MAGIC1     0x5A  /* 'Z' */
+#define ZSTDCOL_MAGIC2     0x43  /* 'C' */
+#define ZSTDCOL_MAGIC3     0x01  /* format version 1 */
+#define ZSTDCOL_MAGIC4     0x00  /* reserved */
 
-/* Header size for full compressed format: magic(2) + type(1) + flags(1) + size(4) */
-#define ZSTDCOL_HDR_SIZE   8
+/* Header size for full compressed format: magic(4) + type(1) + flags(1) + size(4) */
+#define ZSTDCOL_HDR_SIZE   10
 
-/* Header size for passthrough format: magic(2) + type|0x80(1) */
-#define ZSTDCOL_PT_HDR     3
+/* Header size for passthrough format: magic(4) + type|0x80(1) */
+#define ZSTDCOL_PT_HDR     5
 
 /* Flag: dictionary was used for compression */
 #define ZSTDCOL_FLAG_DICT  0x01
@@ -422,12 +424,14 @@ static void zstdCompressFunc(
   /* Write header */
   pOut[0] = ZSTDCOL_MAGIC1;
   pOut[1] = ZSTDCOL_MAGIC2;
-  pOut[2] = (unsigned char)origType;
-  pOut[3] = flags;
-  pOut[4] = (unsigned char)((nIn) & 0xFF);
-  pOut[5] = (unsigned char)((nIn >> 8) & 0xFF);
-  pOut[6] = (unsigned char)((nIn >> 16) & 0xFF);
-  pOut[7] = (unsigned char)((nIn >> 24) & 0xFF);
+  pOut[2] = ZSTDCOL_MAGIC3;
+  pOut[3] = ZSTDCOL_MAGIC4;
+  pOut[4] = (unsigned char)origType;
+  pOut[5] = flags;
+  pOut[6] = (unsigned char)((nIn) & 0xFF);
+  pOut[7] = (unsigned char)((nIn >> 8) & 0xFF);
+  pOut[8] = (unsigned char)((nIn >> 16) & 0xFF);
+  pOut[9] = (unsigned char)((nIn >> 24) & 0xFF);
 
   /* Compress */
   if( pDict ){
@@ -465,7 +469,9 @@ static void zstdCompressFunc(
     }
     pOut[0] = ZSTDCOL_MAGIC1;
     pOut[1] = ZSTDCOL_MAGIC2;
-    pOut[2] = (unsigned char)(origType | ZSTDCOL_PASSTHRU);
+    pOut[2] = ZSTDCOL_MAGIC3;
+    pOut[3] = ZSTDCOL_MAGIC4;
+    pOut[4] = (unsigned char)(origType | ZSTDCOL_PASSTHRU);
     memcpy(pOut + ZSTDCOL_PT_HDR, pIn, nIn);
     sqlite3_result_blob(ctx, pOut, ZSTDCOL_PT_HDR + nIn, sqlite3_free);
   }else{
@@ -513,13 +519,15 @@ static void zstdDecompressFunc(
   if( nIn<ZSTDCOL_PT_HDR
    || pIn[0]!=ZSTDCOL_MAGIC1
    || pIn[1]!=ZSTDCOL_MAGIC2
+   || pIn[2]!=ZSTDCOL_MAGIC3
+   || pIn[3]!=ZSTDCOL_MAGIC4
   ){
     /* Not our format - pass through unchanged */
     sqlite3_result_value(ctx, argv[0]);
     return;
   }
 
-  typeByte = pIn[2];
+  typeByte = pIn[4];
 
   /* Check for passthrough marker */
   if( typeByte & ZSTDCOL_PASSTHRU ){
@@ -554,12 +562,12 @@ static void zstdDecompressFunc(
     return;
   }
 
-  origType = pIn[2];
-  flags = pIn[3];
-  nOrig = (unsigned int)pIn[4]
-        | ((unsigned int)pIn[5] << 8)
-        | ((unsigned int)pIn[6] << 16)
-        | ((unsigned int)pIn[7] << 24);
+  origType = pIn[4];
+  flags = pIn[5];
+  nOrig = (unsigned int)pIn[6]
+        | ((unsigned int)pIn[7] << 8)
+        | ((unsigned int)pIn[8] << 16)
+        | ((unsigned int)pIn[9] << 24);
 
   if( nOrig>(unsigned int)ZSTDCOL_MAX_DECOMP ){
     sqlite3_result_error(ctx, "decompressed size exceeds safety limit", -1);
@@ -1342,8 +1350,8 @@ static void zstdCompressTableFunc(
         "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_compress(\"%w\", %Q)"
         " WHERE \"%w\" IS NOT NULL"
         " AND (typeof(\"%w\")!='blob'"
-        " OR length(\"%w\")<3"
-        " OR substr(\"%w\",1,2)!=x'1A5D')",
+        " OR length(\"%w\")<5"
+        " OR substr(\"%w\",1,4)!=x'5A430100')",
         zTable, aCols[i].zName, aCols[i].zName, aCols[i].zDict,
         aCols[i].zName, aCols[i].zName, aCols[i].zName, aCols[i].zName);
     }else{
@@ -1351,8 +1359,8 @@ static void zstdCompressTableFunc(
         "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_compress(\"%w\")"
         " WHERE \"%w\" IS NOT NULL"
         " AND (typeof(\"%w\")!='blob'"
-        " OR length(\"%w\")<3"
-        " OR substr(\"%w\",1,2)!=x'1A5D')",
+        " OR length(\"%w\")<5"
+        " OR substr(\"%w\",1,4)!=x'5A430100')",
         zTable, aCols[i].zName, aCols[i].zName,
         aCols[i].zName, aCols[i].zName, aCols[i].zName, aCols[i].zName);
     }
