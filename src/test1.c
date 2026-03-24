@@ -8400,6 +8400,9 @@ static int SQLITE_TCLAPI tclLoadStaticExtensionCmd(
 #ifdef SQLITE_HAVE_ZLIB
   extern int sqlite3_zipfile_init(sqlite3*,char**,const sqlite3_api_routines*);
 #endif
+#ifdef SQLITE_HAVE_ZSTD
+  extern int sqlite3_zstdcol_init(sqlite3*,char**,const sqlite3_api_routines*);
+#endif
   static const struct {
     const char *zExtName;
     int (*pInit)(sqlite3*,char**,const sqlite3_api_routines*);
@@ -8431,6 +8434,9 @@ static int SQLITE_TCLAPI tclLoadStaticExtensionCmd(
     { "wholenumber",           sqlite3_wholenumber_init          },
 #ifdef SQLITE_HAVE_ZLIB
     { "zipfile",               sqlite3_zipfile_init              },
+#endif
+#ifdef SQLITE_HAVE_ZSTD
+    { "zstdcol",               sqlite3_zstdcol_init              },
 #endif
   };
   sqlite3 *db;

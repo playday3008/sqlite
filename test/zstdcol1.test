@@ -1,0 +1,288 @@
+# 2026 March 24
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for the zstdcol extension: per-column zstd compression with
+# dictionary support and transparent compression via views/triggers.
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix zstdcol
+
+if {[catch {load_static_extension db zstdcol} error]} {
+  puts "Skipping zstdcol tests, hit load error: $error"
+  finish_test; return
+}
+
+#--------------------------------------------------------------------------
+# 1. Basic compress/decompress round-trip
+#--------------------------------------------------------------------------
+
+do_execsql_test 1.1 {
+  SELECT zstd_decompress(zstd_compress('hello world'));
+} {{hello world}}
+
+do_execsql_test 1.2 {
+  SELECT typeof(zstd_decompress(zstd_compress('hello world')));
+} {text}
+
+do_execsql_test 1.3 {
+  SELECT hex(zstd_decompress(zstd_compress(x'DEADBEEF')));
+} {DEADBEEF}
+
+do_execsql_test 1.4 {
+  SELECT typeof(zstd_decompress(zstd_compress(x'DEADBEEF')));
+} {blob}
+
+do_execsql_test 1.5 {
+  SELECT zstd_decompress(zstd_compress(42));
+} {42}
+
+do_execsql_test 1.6 {
+  SELECT typeof(zstd_decompress(zstd_compress(42)));
+} {integer}
+
+do_execsql_test 1.7 {
+  SELECT zstd_decompress(zstd_compress(3.14));
+} {3.14}
+
+do_execsql_test 1.8 {
+  SELECT typeof(zstd_decompress(zstd_compress(3.14)));
+} {real}
+
+do_execsql_test 1.9 {
+  SELECT zstd_decompress(zstd_compress(NULL)) IS NULL;
+} {1}
+
+# Large text (should actually compress)
+do_execsql_test 1.10 {
+  SELECT zstd_decompress(zstd_compress(
+    zeroblob(10000)
+  )) = zeroblob(10000);
+} {1}
+
+# Compressed output should be smaller than input for repetitive data
+do_execsql_test 1.11 {
+  SELECT length(zstd_compress(zeroblob(10000))) < 10000;
+} {1}
+
+#--------------------------------------------------------------------------
+# 2. Metadata tables exist after loading
+#--------------------------------------------------------------------------
+
+do_execsql_test 2.1 {
+  SELECT count(*) FROM _zstd_dicts;
+} {0}
+
+do_execsql_test 2.2 {
+  SELECT count(*) FROM _zstd_config;
+} {0}
+
+#--------------------------------------------------------------------------
+# 3. Transparent compression: enable/disable
+#--------------------------------------------------------------------------
+
+do_execsql_test 3.1 {
+  CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, body TEXT, score REAL);
+  INSERT INTO t1 VALUES(1, 'alice', 'The quick brown fox jumps over the lazy dog', 9.5);
+  INSERT INTO t1 VALUES(2, 'bob', 'Pack my box with five dozen liquor jugs', 8.0);
+  INSERT INTO t1 VALUES(3, 'carol', 'How vexingly quick daft zebras jump', 7.5);
+}
+
+do_execsql_test 3.2 {
+  INSERT INTO _zstd_config(tbl, col) VALUES('t1', 'body');
+  SELECT zstd_enable('t1');
+} {ok}
+
+# Verify schema: table renamed, view created
+do_execsql_test 3.3 {
+  SELECT type, name FROM sqlite_master
+  WHERE name IN ('t1', '_t1_zstd')
+  ORDER BY name;
+} {_t1_zstd table t1 view}
+
+# Read through view returns original data
+do_execsql_test 3.4 {
+  SELECT id, name, body, score FROM t1 ORDER BY id;
+} {1 alice {The quick brown fox jumps over the lazy dog} 9.5 2 bob {Pack my box with five dozen liquor jugs} 8.0 3 carol {How vexingly quick daft zebras jump} 7.5}
+
+# INSERT through view
+do_execsql_test 3.5 {
+  INSERT INTO t1 VALUES(4, 'dave', 'New message inserted through view', 6.0);
+  SELECT body FROM t1 WHERE id=4;
+} {{New message inserted through view}}
+
+# UPDATE through view
+do_execsql_test 3.6 {
+  UPDATE t1 SET body='Updated body content here' WHERE id=1;
+  SELECT body FROM t1 WHERE id=1;
+} {{Updated body content here}}
+
+# DELETE through view
+do_execsql_test 3.7 {
+  DELETE FROM t1 WHERE id=2;
+  SELECT count(*) FROM t1;
+} {3}
+
+# Non-compressed columns are unaffected
+do_execsql_test 3.8 {
+  SELECT name, score FROM t1 WHERE id=3;
+} {carol 7.5}
+
+# Disable and verify data is decompressed back
+do_execsql_test 3.9 {
+  SELECT zstd_disable('t1');
+} {ok}
+
+do_execsql_test 3.10 {
+  SELECT type FROM sqlite_master WHERE name='t1';
+} {table}
+
+do_execsql_test 3.11 {
+  SELECT id, name, body FROM t1 ORDER BY id;
+} {1 alice {Updated body content here} 3 carol {How vexingly quick daft zebras jump} 4 dave {New message inserted through view}}
+
+# Types are preserved after disable
+do_execsql_test 3.12 {
+  SELECT typeof(body) FROM t1 LIMIT 1;
+} {text}
+
+#--------------------------------------------------------------------------
+# 4. Multiple compressed columns
+#--------------------------------------------------------------------------
+
+do_execsql_test 4.1 {
+  CREATE TABLE t2(id INTEGER PRIMARY KEY, title TEXT, body TEXT, footer TEXT);
+  INSERT INTO t2 VALUES(1, 'Title One', 'Body text for row one', 'Footer one');
+  INSERT INTO _zstd_config(tbl, col) VALUES('t2', 'body');
+  INSERT INTO _zstd_config(tbl, col) VALUES('t2', 'footer');
+  SELECT zstd_enable('t2');
+} {ok}
+
+do_execsql_test 4.2 {
+  INSERT INTO t2 VALUES(2, 'Title Two', 'Body text for row two', 'Footer two');
+  SELECT title, body, footer FROM t2 ORDER BY id;
+} {{Title One} {Body text for row one} {Footer one} {Title Two} {Body text for row two} {Footer two}}
+
+do_execsql_test 4.3 {
+  SELECT zstd_disable('t2');
+  SELECT typeof(body), typeof(footer) FROM t2 WHERE id=2;
+} {ok text text}
+
+#--------------------------------------------------------------------------
+# 5. Error cases
+#--------------------------------------------------------------------------
+
+# Enable without config
+do_catchsql_test 5.1 {
+  CREATE TABLE t3(id INTEGER PRIMARY KEY, data TEXT);
+  SELECT zstd_enable('t3');
+} {1 {no columns configured for compression in _zstd_config}}
+
+# Enable on non-existent table
+do_catchsql_test 5.2 {
+  INSERT INTO _zstd_config(tbl, col) VALUES('nonexistent', 'col');
+  SELECT zstd_enable('nonexistent');
+} {1 {table not found: nonexistent}}
+
+# Disable on non-enabled table
+do_catchsql_test 5.3 {
+  SELECT zstd_disable('t3');
+} {1 {compression not enabled for this table (storage table not found)}}
+
+# Double enable
+do_catchsql_test 5.4 {
+  INSERT INTO _zstd_config(tbl, col) VALUES('t3', 'data');
+  SELECT zstd_enable('t3');
+} {0 ok}
+do_catchsql_test 5.5 {
+  SELECT zstd_enable('t3');
+} {1 {table appears to already be enabled for compression}}
+
+# Clean up
+do_execsql_test 5.6 {
+  SELECT zstd_disable('t3');
+} {ok}
+
+#--------------------------------------------------------------------------
+# 6. Compress/decompress table (bulk operations)
+#--------------------------------------------------------------------------
+
+do_execsql_test 6.1 {
+  CREATE TABLE t4(id INTEGER PRIMARY KEY, data TEXT);
+  INSERT INTO t4 VALUES(1, 'First row of data for bulk test');
+  INSERT INTO t4 VALUES(2, 'Second row of data for bulk test');
+  INSERT INTO _zstd_config(tbl, col) VALUES('t4', 'data');
+  SELECT zstd_enable('t4');
+} {ok}
+
+# Data from before enable is still uncompressed in storage table
+# compress_table should compress it
+do_execsql_test 6.2 {
+  SELECT zstd_compress_table('t4');
+} {ok}
+
+# Reading through view still works
+do_execsql_test 6.3 {
+  SELECT data FROM t4 ORDER BY id;
+} {{First row of data for bulk test} {Second row of data for bulk test}}
+
+# Disable (decompresses automatically)
+do_execsql_test 6.4 {
+  SELECT zstd_disable('t4');
+  SELECT data, typeof(data) FROM t4 ORDER BY id;
+} {{First row of data for bulk test} text {Second row of data for bulk test} text}
+
+#--------------------------------------------------------------------------
+# 7. NULL handling in compressed columns
+#--------------------------------------------------------------------------
+
+do_execsql_test 7.1 {
+  CREATE TABLE t5(id INTEGER PRIMARY KEY, data TEXT);
+  INSERT INTO t5 VALUES(1, NULL);
+  INSERT INTO t5 VALUES(2, 'not null');
+  INSERT INTO _zstd_config(tbl, col) VALUES('t5', 'data');
+  SELECT zstd_enable('t5');
+} {ok}
+
+do_execsql_test 7.2 {
+  SELECT id, data IS NULL FROM t5 ORDER BY id;
+} {1 1 2 0}
+
+do_execsql_test 7.3 {
+  INSERT INTO t5 VALUES(3, NULL);
+  SELECT id, data IS NULL FROM t5 WHERE id=3;
+} {3 1}
+
+do_execsql_test 7.4 {
+  SELECT zstd_disable('t5');
+} {ok}
+
+#--------------------------------------------------------------------------
+# 8. Table with special characters in column names
+#--------------------------------------------------------------------------
+
+do_execsql_test 8.1 {
+  CREATE TABLE t6(id INTEGER PRIMARY KEY, "my col" TEXT, "another col" TEXT);
+  INSERT INTO t6 VALUES(1, 'value one', 'other one');
+  INSERT INTO _zstd_config(tbl, col) VALUES('t6', 'my col');
+  SELECT zstd_enable('t6');
+} {ok}
+
+do_execsql_test 8.2 {
+  INSERT INTO t6 VALUES(2, 'value two', 'other two');
+  SELECT "my col", "another col" FROM t6 ORDER BY id;
+} {{value one} {other one} {value two} {other two}}
+
+do_execsql_test 8.3 {
+  SELECT zstd_disable('t6');
+} {ok}
+
+finish_test
