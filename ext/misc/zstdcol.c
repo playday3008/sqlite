@@ -459,7 +459,7 @@ static void zstdCompressFunc(
 
   /* Check if compression actually helped */
   if( nComp + ZSTDCOL_HDR_SIZE >= (size_t)nIn + ZSTDCOL_PT_HDR ){
-    /* Passthrough: magic(2) + type|0x80(1) + original data */
+    /* Passthrough: magic(4) + type|0x80(1) + original data */
     sqlite3_free(pOut);
     pOut = sqlite3_malloc64(ZSTDCOL_PT_HDR + nIn);
     if( pOut==0 ){
@@ -472,7 +472,7 @@ static void zstdCompressFunc(
     pOut[2] = ZSTDCOL_MAGIC3;
     pOut[3] = ZSTDCOL_MAGIC4;
     pOut[4] = (unsigned char)(origType | ZSTDCOL_PASSTHRU);
-    memcpy(pOut + ZSTDCOL_PT_HDR, pIn, nIn);
+    if( nIn>0 ) memcpy(pOut + ZSTDCOL_PT_HDR, pIn, nIn);
     sqlite3_result_blob(ctx, pOut, ZSTDCOL_PT_HDR + nIn, sqlite3_free);
   }else{
     sqlite3_result_blob(ctx, pOut, (int)(ZSTDCOL_HDR_SIZE + nComp), sqlite3_free);
@@ -923,7 +923,15 @@ static int zstdGetColInfo(
       for(j=0; j<nCols; j++){
         if( sqlite3_stricmp(aCols[j].zName, zCol)==0 ){
           aCols[j].bCompress = 1;
-          aCols[j].zDict = zDictName ? sqlite3_mprintf("%s", zDictName) : 0;
+          if( zDictName ){
+            aCols[j].zDict = sqlite3_mprintf("%s", zDictName);
+            if( aCols[j].zDict==0 ){
+              sqlite3_finalize(pStmt);
+              zstdFreeColInfo(aCols, nCols);
+              sqlite3_free(zPkCol);
+              return SQLITE_NOMEM;
+            }
+          }
           aCols[j].iLevel = iLevel>0 ? iLevel : ZSTDCOL_DEFAULT_LEVEL;
           break;
         }
@@ -1248,18 +1256,24 @@ static void zstdDisableFunc(
   rc = SQLITE_OK;
   zstdDbExec(&rc, db, "SAVEPOINT zstd_disable");
 
-  /* Decompress all compressed columns in the storage table */
+  /* Decompress only rows that contain compressed data (magic prefix check) */
   if( aCols ){
     for(i=0; i<nCols && rc==SQLITE_OK; i++){
       if( !aCols[i].bCompress ) continue;
       if( aCols[i].zDict ){
         zstdDbExec(&rc, db,
-          "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_decompress(\"%w\", %Q)",
-          zTable, aCols[i].zName, aCols[i].zName, aCols[i].zDict);
+          "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_decompress(\"%w\", %Q)"
+          " WHERE typeof(\"%w\")='blob' AND length(\"%w\")>=5"
+          " AND substr(\"%w\",1,4)=x'5A430100'",
+          zTable, aCols[i].zName, aCols[i].zName, aCols[i].zDict,
+          aCols[i].zName, aCols[i].zName, aCols[i].zName);
       }else{
         zstdDbExec(&rc, db,
-          "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_decompress(\"%w\")",
-          zTable, aCols[i].zName, aCols[i].zName);
+          "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_decompress(\"%w\")"
+          " WHERE typeof(\"%w\")='blob' AND length(\"%w\")>=5"
+          " AND substr(\"%w\",1,4)=x'5A430100'",
+          zTable, aCols[i].zName, aCols[i].zName,
+          aCols[i].zName, aCols[i].zName, aCols[i].zName);
       }
     }
   }
@@ -1341,9 +1355,9 @@ static void zstdCompressTableFunc(
     if( !aCols[i].bCompress ) continue;
     /*
     ** Only compress rows where the column is not already compressed.
-    ** We detect already-compressed data by checking for our 2-byte magic
-    ** prefix (0x1A 0x5D). This is reliable because the magic bytes are
-    ** unlikely to appear as the first two bytes of user data.
+    ** We detect already-compressed data by checking for our 4-byte magic
+    ** prefix (0x5A 0x43 0x01 0x00). This is reliable because the magic
+    ** bytes are unlikely to appear as the first four bytes of user data.
     */
     if( aCols[i].zDict ){
       zstdDbExec(&rc, db,
@@ -1429,15 +1443,21 @@ static void zstdDecompressTableFunc(
 
   for(i=0; i<nCols && rc==SQLITE_OK; i++){
     if( !aCols[i].bCompress ) continue;
-    /* zstd_decompress passes through non-compressed data safely */
+    /* Only decompress rows that actually contain our compressed format */
     if( aCols[i].zDict ){
       zstdDbExec(&rc, db,
-        "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_decompress(\"%w\", %Q)",
-        zTable, aCols[i].zName, aCols[i].zName, aCols[i].zDict);
+        "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_decompress(\"%w\", %Q)"
+        " WHERE typeof(\"%w\")='blob' AND length(\"%w\")>=5"
+        " AND substr(\"%w\",1,4)=x'5A430100'",
+        zTable, aCols[i].zName, aCols[i].zName, aCols[i].zDict,
+        aCols[i].zName, aCols[i].zName, aCols[i].zName);
     }else{
       zstdDbExec(&rc, db,
-        "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_decompress(\"%w\")",
-        zTable, aCols[i].zName, aCols[i].zName);
+        "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_decompress(\"%w\")"
+        " WHERE typeof(\"%w\")='blob' AND length(\"%w\")>=5"
+        " AND substr(\"%w\",1,4)=x'5A430100'",
+        zTable, aCols[i].zName, aCols[i].zName,
+        aCols[i].zName, aCols[i].zName, aCols[i].zName);
     }
   }
 
@@ -1497,10 +1517,20 @@ int sqlite3_zstdcol_init(
   ** Register compress/decompress as INNOCUOUS because they appear inside
   ** VIEWs and TRIGGERs stored in the schema. They are pure data
   ** transformation with no side effects.
+  **
+  ** Attach the destructor to the first registration so pGlobal is always
+  ** freed when the connection closes, even if later registrations fail.
   */
   rc = sqlite3_create_function_v2(db, "zstd_compress", 1,
     SQLITE_UTF8 | SQLITE_INNOCUOUS | SQLITE_DETERMINISTIC,
-    pGlobal, zstdCompressFunc, 0, 0, 0);
+    pGlobal, zstdCompressFunc, 0, 0, zstdGlobalFree);
+  if( rc!=SQLITE_OK ){
+    /* Destructor was not called because registration failed; free manually */
+    zstdGlobalFree(pGlobal);
+    return rc;
+  }
+  /* From here on, pGlobal is owned by the first registration's destructor.
+  ** Do not free it manually on error -- it will be freed when db closes. */
   if( rc==SQLITE_OK ){
     rc = sqlite3_create_function_v2(db, "zstd_compress", 2,
       SQLITE_UTF8 | SQLITE_INNOCUOUS | SQLITE_DETERMINISTIC,
@@ -1541,17 +1571,10 @@ int sqlite3_zstdcol_init(
       SQLITE_UTF8 | SQLITE_DIRECTONLY,
       pGlobal, zstdCompressTableFunc, 0, 0, 0);
   }
-
-  /*
-  ** Last registration: attach the destructor to free pGlobal when the
-  ** connection closes (following spellfix.c pattern).
-  */
   if( rc==SQLITE_OK ){
     rc = sqlite3_create_function_v2(db, "zstd_decompress_table", 1,
       SQLITE_UTF8 | SQLITE_DIRECTONLY,
-      pGlobal, zstdDecompressTableFunc, 0, 0, zstdGlobalFree);
-  }else{
-    zstdGlobalFree(pGlobal);
+      pGlobal, zstdDecompressTableFunc, 0, 0, 0);
   }
 
   return rc;
