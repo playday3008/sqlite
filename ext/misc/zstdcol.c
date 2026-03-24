@@ -403,6 +403,11 @@ static void zstdCompressFunc(
   /* Get dictionary if provided */
   if( argc>=2 && sqlite3_value_type(argv[1])!=SQLITE_NULL ){
     zDict = (const char*)sqlite3_value_text(argv[1]);
+    if( zDict==0 ){
+      sqlite3_free(pRaw);
+      sqlite3_result_error_nomem(ctx);
+      return;
+    }
     pDict = zstdFindDict(pGlobal, zDict);
     if( pDict==0 ){
       sqlite3_free(pRaw);
@@ -1024,7 +1029,7 @@ static void zstdEnableFunc(
   {
     sqlite3_stmt *pChk = 0;
     char *zChk = sqlite3_mprintf(
-      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_%w_zstd'",
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_%q_zstd'",
       zTable);
     if( zChk==0 ){
       zstdFreeColInfo(aCols, nCols);
@@ -1226,7 +1231,7 @@ static void zstdDisableFunc(
   {
     sqlite3_stmt *pChk = 0;
     char *zChk = sqlite3_mprintf(
-      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_%w_zstd'",
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_%q_zstd'",
       zTable);
     if( zChk==0 ){
       sqlite3_result_error_nomem(ctx);
