@@ -325,13 +325,13 @@ static void zstdPutInt64(unsigned char *p, sqlite3_int64 v){
 ** Deserialize a 64-bit integer from a buffer (little-endian, 8 bytes).
 */
 static sqlite3_int64 zstdGetInt64(const unsigned char *p, int n){
-  sqlite3_int64 v = 0;
+  sqlite3_uint64 v = 0;
   int i;
   if( n>8 ) n = 8;
   for(i=n-1; i>=0; i--){
     v = (v << 8) | p[i];
   }
-  return v;
+  return (sqlite3_int64)v;
 }
 
 /*
