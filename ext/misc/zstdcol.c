@@ -52,25 +52,43 @@
 **
 ** Compressed blob wire format:
 **
-**   Byte 0:     Original SQLite type (1=INT, 2=FLOAT, 3=TEXT, 4=BLOB)
-**   Byte 1:     Flags (bit 0: dictionary was used)
-**   Bytes 2-5:  Uncompressed size, little-endian uint32
-**   Bytes 6+:   Zstd compressed data
+**   Bytes 0-1:  Magic bytes 0x1A 0x5D
+**   Byte 2:     Original SQLite type (1=INT, 2=FLOAT, 3=TEXT, 4=BLOB)
+**   Byte 3:     Flags (bit 0: dictionary was used)
+**   Bytes 4-7:  Uncompressed size, little-endian uint32
+**   Bytes 8+:   Zstd compressed data
 **
 **   Passthrough (compression didn't help):
-**   Byte 0:     Original type | 0x80
-**   Bytes 1+:   Original data unchanged
+**   Bytes 0-1:  Magic bytes 0x1A 0x5D
+**   Byte 2:     Original type | 0x80
+**   Bytes 3+:   Original data unchanged
 */
+
+/*
+** When compiled as part of the testfixture, require SQLITE_HAVE_ZSTD to be
+** defined.  When compiled standalone as a loadable extension, include
+** unconditionally.
+*/
+#if !defined(SQLITE_CORE) || defined(SQLITE_HAVE_ZSTD)
+
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
 
 #include <zstd.h>
 #include <zdict.h>
 #include <string.h>
+#include <stdarg.h>
 #include <assert.h>
 
-/* Header size for compressed format */
-#define ZSTDCOL_HDR_SIZE   6
+/* Magic bytes identifying a zstdcol compressed blob */
+#define ZSTDCOL_MAGIC1     0x1A
+#define ZSTDCOL_MAGIC2     0x5D
+
+/* Header size for full compressed format: magic(2) + type(1) + flags(1) + size(4) */
+#define ZSTDCOL_HDR_SIZE   8
+
+/* Header size for passthrough format: magic(2) + type|0x80(1) */
+#define ZSTDCOL_PT_HDR     3
 
 /* Flag: dictionary was used for compression */
 #define ZSTDCOL_FLAG_DICT  0x01
@@ -130,6 +148,7 @@ typedef struct ZstdColInfo {
 static void zstdGlobalFree(void *p);
 static ZstdDictEntry *zstdFindDict(ZstdGlobal *pGlobal, const char *zName);
 static int zstdEnsureTables(sqlite3 *db, char **pzErr);
+static void zstdFreeColInfo(ZstdColInfo *, int);
 
 /*
 ** Free a ZstdGlobal and all cached dictionaries.
@@ -314,18 +333,23 @@ static sqlite3_int64 zstdGetInt64(const unsigned char *p, int n){
 }
 
 /*
-** Serialize a double into a buffer (8 bytes, memcpy for portability).
+** Serialize a double into a buffer (8 bytes, portable via int64 conversion).
 */
 static void zstdPutDouble(unsigned char *p, double v){
-  memcpy(p, &v, 8);
+  sqlite3_int64 i;
+  memcpy(&i, &v, 8);
+  zstdPutInt64(p, i);
 }
 
 /*
-** Deserialize a double from a buffer (8 bytes).
+** Deserialize a double from a buffer (8 bytes, portable via int64 conversion).
 */
 static double zstdGetDouble(const unsigned char *p, int n){
+  sqlite3_int64 i;
   double v = 0.0;
-  if( n>=8 ) memcpy(&v, p, 8);
+  if( n<8 ) return v;
+  i = zstdGetInt64(p, n);
+  memcpy(&v, &i, 8);
   return v;
 }
 
@@ -358,23 +382,17 @@ static void zstdCompressFunc(
 
   /* For INTEGER and REAL, serialize to bytes first */
   if( origType==SQLITE_INTEGER ){
-    unsigned char buf[8];
-    zstdPutInt64(buf, sqlite3_value_int64(argv[0]));
-    pIn = buf;
-    nIn = 8;
     pRaw = sqlite3_malloc64(8);
     if( pRaw==0 ){ sqlite3_result_error_nomem(ctx); return; }
-    memcpy(pRaw, buf, 8);
+    zstdPutInt64(pRaw, sqlite3_value_int64(argv[0]));
     pIn = pRaw;
+    nIn = 8;
   }else if( origType==SQLITE_FLOAT ){
-    unsigned char buf[8];
-    zstdPutDouble(buf, sqlite3_value_double(argv[0]));
-    pIn = buf;
-    nIn = 8;
     pRaw = sqlite3_malloc64(8);
     if( pRaw==0 ){ sqlite3_result_error_nomem(ctx); return; }
-    memcpy(pRaw, buf, 8);
+    zstdPutDouble(pRaw, sqlite3_value_double(argv[0]));
     pIn = pRaw;
+    nIn = 8;
   }else{
     pIn = sqlite3_value_blob(argv[0]);
     nIn = sqlite3_value_bytes(argv[0]);
@@ -402,12 +420,14 @@ static void zstdCompressFunc(
   }
 
   /* Write header */
-  pOut[0] = (unsigned char)origType;
-  pOut[1] = flags;
-  pOut[2] = (unsigned char)((nIn) & 0xFF);
-  pOut[3] = (unsigned char)((nIn >> 8) & 0xFF);
-  pOut[4] = (unsigned char)((nIn >> 16) & 0xFF);
-  pOut[5] = (unsigned char)((nIn >> 24) & 0xFF);
+  pOut[0] = ZSTDCOL_MAGIC1;
+  pOut[1] = ZSTDCOL_MAGIC2;
+  pOut[2] = (unsigned char)origType;
+  pOut[3] = flags;
+  pOut[4] = (unsigned char)((nIn) & 0xFF);
+  pOut[5] = (unsigned char)((nIn >> 8) & 0xFF);
+  pOut[6] = (unsigned char)((nIn >> 16) & 0xFF);
+  pOut[7] = (unsigned char)((nIn >> 24) & 0xFF);
 
   /* Compress */
   if( pDict ){
@@ -434,18 +454,20 @@ static void zstdCompressFunc(
   }
 
   /* Check if compression actually helped */
-  if( (int)(nComp + ZSTDCOL_HDR_SIZE) >= nIn + 1 ){
-    /* Passthrough: 1-byte type marker + original data */
+  if( nComp + ZSTDCOL_HDR_SIZE >= (size_t)nIn + ZSTDCOL_PT_HDR ){
+    /* Passthrough: magic(2) + type|0x80(1) + original data */
     sqlite3_free(pOut);
-    pOut = sqlite3_malloc64(1 + nIn);
+    pOut = sqlite3_malloc64(ZSTDCOL_PT_HDR + nIn);
     if( pOut==0 ){
       sqlite3_free(pRaw);
       sqlite3_result_error_nomem(ctx);
       return;
     }
-    pOut[0] = (unsigned char)(origType | ZSTDCOL_PASSTHRU);
-    memcpy(pOut + 1, pIn, nIn);
-    sqlite3_result_blob(ctx, pOut, 1 + nIn, sqlite3_free);
+    pOut[0] = ZSTDCOL_MAGIC1;
+    pOut[1] = ZSTDCOL_MAGIC2;
+    pOut[2] = (unsigned char)(origType | ZSTDCOL_PASSTHRU);
+    memcpy(pOut + ZSTDCOL_PT_HDR, pIn, nIn);
+    sqlite3_result_blob(ctx, pOut, ZSTDCOL_PT_HDR + nIn, sqlite3_free);
   }else{
     sqlite3_result_blob(ctx, pOut, (int)(ZSTDCOL_HDR_SIZE + nComp), sqlite3_free);
   }
@@ -487,31 +509,41 @@ static void zstdDecompressFunc(
   pIn = (const unsigned char*)sqlite3_value_blob(argv[0]);
   nIn = sqlite3_value_bytes(argv[0]);
 
-  if( nIn<1 ){
-    sqlite3_result_zeroblob(ctx, 0);
+  /* Verify minimum size and magic bytes */
+  if( nIn<ZSTDCOL_PT_HDR
+   || pIn[0]!=ZSTDCOL_MAGIC1
+   || pIn[1]!=ZSTDCOL_MAGIC2
+  ){
+    /* Not our format - pass through unchanged */
+    sqlite3_result_value(ctx, argv[0]);
     return;
   }
 
-  typeByte = pIn[0];
+  typeByte = pIn[2];
 
   /* Check for passthrough marker */
   if( typeByte & ZSTDCOL_PASSTHRU ){
     origType = typeByte & 0x7F;
     switch( origType ){
       case SQLITE_TEXT:
-        sqlite3_result_text(ctx, (const char*)(pIn+1), nIn-1, SQLITE_TRANSIENT);
+        sqlite3_result_text(ctx, (const char*)(pIn+ZSTDCOL_PT_HDR),
+          nIn-ZSTDCOL_PT_HDR, SQLITE_TRANSIENT);
         return;
       case SQLITE_BLOB:
-        sqlite3_result_blob(ctx, pIn+1, nIn-1, SQLITE_TRANSIENT);
+        sqlite3_result_blob(ctx, pIn+ZSTDCOL_PT_HDR,
+          nIn-ZSTDCOL_PT_HDR, SQLITE_TRANSIENT);
         return;
       case SQLITE_INTEGER:
-        sqlite3_result_int64(ctx, zstdGetInt64(pIn+1, nIn-1));
+        sqlite3_result_int64(ctx, zstdGetInt64(pIn+ZSTDCOL_PT_HDR,
+          nIn-ZSTDCOL_PT_HDR));
         return;
       case SQLITE_FLOAT:
-        sqlite3_result_double(ctx, zstdGetDouble(pIn+1, nIn-1));
+        sqlite3_result_double(ctx, zstdGetDouble(pIn+ZSTDCOL_PT_HDR,
+          nIn-ZSTDCOL_PT_HDR));
         return;
       default:
-        sqlite3_result_blob(ctx, pIn+1, nIn-1, SQLITE_TRANSIENT);
+        sqlite3_result_blob(ctx, pIn+ZSTDCOL_PT_HDR,
+          nIn-ZSTDCOL_PT_HDR, SQLITE_TRANSIENT);
         return;
     }
   }
@@ -522,12 +554,12 @@ static void zstdDecompressFunc(
     return;
   }
 
-  origType = pIn[0];
-  flags = pIn[1];
-  nOrig = (unsigned int)pIn[2]
-        | ((unsigned int)pIn[3] << 8)
-        | ((unsigned int)pIn[4] << 16)
-        | ((unsigned int)pIn[5] << 24);
+  origType = pIn[2];
+  flags = pIn[3];
+  nOrig = (unsigned int)pIn[4]
+        | ((unsigned int)pIn[5] << 8)
+        | ((unsigned int)pIn[6] << 16)
+        | ((unsigned int)pIn[7] << 24);
 
   if( nOrig>(unsigned int)ZSTDCOL_MAX_DECOMP ){
     sqlite3_result_error(ctx, "decompressed size exceeds safety limit", -1);
@@ -688,8 +720,12 @@ static void zstdTrainDictFunc(
     /* Grow sample buffer if needed */
     if( nSampleBuf + nBlob > nSampleBufAlloc ){
       size_t nNew = (nSampleBufAlloc ? nSampleBufAlloc*2 : 1024*1024);
-      while( nNew < nSampleBuf + nBlob ) nNew *= 2;
-      unsigned char *pNew = sqlite3_realloc64(pSampleBuf, nNew);
+      unsigned char *pNew;
+      while( nNew < nSampleBuf + nBlob ){
+        if( nNew > ((size_t)-1)/2 ) break;  /* overflow guard */
+        nNew *= 2;
+      }
+      pNew = sqlite3_realloc64(pSampleBuf, nNew);
       if( pNew==0 ){
         sqlite3_finalize(pStmt);
         sqlite3_free(pSampleBuf);
@@ -808,9 +844,9 @@ static int zstdGetColInfo(
       int nNew = nAlloc ? nAlloc*2 : 16;
       ZstdColInfo *aNew = sqlite3_realloc64(aCols, nNew*sizeof(ZstdColInfo));
       if( aNew==0 ){
+        int j;
         sqlite3_finalize(pStmt);
-        /* Free what we have */
-        int j; for(j=0;j<nCols;j++){
+        for(j=0;j<nCols;j++){
           sqlite3_free(aCols[j].zName); sqlite3_free(aCols[j].zType);
           sqlite3_free(aCols[j].zDict);
         }
@@ -859,10 +895,7 @@ static int zstdGetColInfo(
   zSql = sqlite3_mprintf(
     "SELECT col, dict_name, level FROM _zstd_config WHERE tbl=%Q", zTable);
   if( zSql==0 ){
-    int j; for(j=0;j<nCols;j++){
-      sqlite3_free(aCols[j].zName); sqlite3_free(aCols[j].zType);
-    }
-    sqlite3_free(aCols);
+    zstdFreeColInfo(aCols, nCols);
     sqlite3_free(zPkCol);
     return SQLITE_NOMEM;
   }
@@ -1067,7 +1100,7 @@ static void zstdEnableFunc(
       }
     }
     if( zWhere==0 ){
-      /* No PK at all — use rowid */
+      /* No PK at all - use rowid */
       zWhere = sqlite3_mprintf("rowid=old.rowid");
     }
   }
@@ -1274,7 +1307,7 @@ static void zstdCompressTableFunc(
     return;
   }
 
-  /* Get column info — use the original table name for config lookup */
+  /* Get column info - use the original table name for config lookup */
   rc = zstdGetColInfo(db, zTable, &aCols, &nCols, &zPkCol, &zErr);
   if( rc!=SQLITE_OK ){
     sqlite3_result_error(ctx, zErr ? zErr : "failed to get table info", -1);
@@ -1289,28 +1322,26 @@ static void zstdCompressTableFunc(
     if( !aCols[i].bCompress ) continue;
     /*
     ** Only compress rows where the column is not already compressed.
-    ** We detect this by checking if the value is NOT a blob, or if it's
-    ** a blob whose first byte is not a valid compressed type marker.
-    ** Valid type markers: 1-4 (compressed) and 0x81-0x84 (passthrough).
+    ** We detect already-compressed data by checking for our 2-byte magic
+    ** prefix (0x1A 0x5D). This is reliable because the magic bytes are
+    ** unlikely to appear as the first two bytes of user data.
     */
     if( aCols[i].zDict ){
       zstdDbExec(&rc, db,
         "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_compress(\"%w\", %Q)"
         " WHERE typeof(\"%w\")!='blob'"
-        " OR length(\"%w\")<1"
-        " OR (unicode(substr(\"%w\",1,1)) NOT BETWEEN 1 AND 4"
-        "     AND unicode(substr(\"%w\",1,1)) NOT BETWEEN 129 AND 132)",
+        " OR length(\"%w\")<3"
+        " OR substr(\"%w\",1,2)!=x'1A5D'",
         zTable, aCols[i].zName, aCols[i].zName, aCols[i].zDict,
-        aCols[i].zName, aCols[i].zName, aCols[i].zName, aCols[i].zName);
+        aCols[i].zName, aCols[i].zName, aCols[i].zName);
     }else{
       zstdDbExec(&rc, db,
         "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_compress(\"%w\")"
         " WHERE typeof(\"%w\")!='blob'"
-        " OR length(\"%w\")<1"
-        " OR (unicode(substr(\"%w\",1,1)) NOT BETWEEN 1 AND 4"
-        "     AND unicode(substr(\"%w\",1,1)) NOT BETWEEN 129 AND 132)",
+        " OR length(\"%w\")<3"
+        " OR substr(\"%w\",1,2)!=x'1A5D'",
         zTable, aCols[i].zName, aCols[i].zName,
-        aCols[i].zName, aCols[i].zName, aCols[i].zName, aCols[i].zName);
+        aCols[i].zName, aCols[i].zName, aCols[i].zName);
     }
   }
 
@@ -1504,3 +1535,5 @@ int sqlite3_zstdcol_init(
 
   return rc;
 }
+
+#endif /* !SQLITE_CORE || SQLITE_HAVE_ZSTD */

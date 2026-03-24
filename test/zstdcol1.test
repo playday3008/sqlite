@@ -61,17 +61,43 @@ do_execsql_test 1.9 {
   SELECT zstd_decompress(zstd_compress(NULL)) IS NULL;
 } {1}
 
-# Large text (should actually compress)
+# Empty string
 do_execsql_test 1.10 {
-  SELECT zstd_decompress(zstd_compress(
-    zeroblob(10000)
-  )) = zeroblob(10000);
+  SELECT zstd_decompress(zstd_compress(''));
+} {{}}
+
+do_execsql_test 1.11 {
+  SELECT typeof(zstd_decompress(zstd_compress('')));
+} {text}
+
+# Large data (should actually compress)
+do_execsql_test 1.12 {
+  SELECT zstd_decompress(zstd_compress(zeroblob(10000))) = zeroblob(10000);
 } {1}
 
 # Compressed output should be smaller than input for repetitive data
-do_execsql_test 1.11 {
+do_execsql_test 1.13 {
   SELECT length(zstd_compress(zeroblob(10000))) < 10000;
 } {1}
+
+# Non-compressed BLOB passed to decompress returns unchanged
+do_execsql_test 1.14 {
+  SELECT hex(zstd_decompress(x'DEADBEEF'));
+} {DEADBEEF}
+
+# Non-BLOB passed to decompress returns unchanged
+do_execsql_test 1.15 {
+  SELECT zstd_decompress('just text');
+} {{just text}}
+
+do_execsql_test 1.16 {
+  SELECT zstd_decompress(42);
+} {42}
+
+# Error: unknown dictionary
+do_catchsql_test 1.17 {
+  SELECT zstd_compress('hello', 'nonexistent_dict');
+} {1 {unknown zstd dictionary}}
 
 #--------------------------------------------------------------------------
 # 2. Metadata tables exist after loading
@@ -223,8 +249,6 @@ do_execsql_test 6.1 {
   SELECT zstd_enable('t4');
 } {ok}
 
-# Data from before enable is still uncompressed in storage table
-# compress_table should compress it
 do_execsql_test 6.2 {
   SELECT zstd_compress_table('t4');
 } {ok}
@@ -234,8 +258,20 @@ do_execsql_test 6.3 {
   SELECT data FROM t4 ORDER BY id;
 } {{First row of data for bulk test} {Second row of data for bulk test}}
 
-# Disable (decompresses automatically)
+# compress_table is idempotent
 do_execsql_test 6.4 {
+  SELECT zstd_compress_table('t4');
+  SELECT data FROM t4 ORDER BY id;
+} {ok {First row of data for bulk test} {Second row of data for bulk test}}
+
+# decompress_table
+do_execsql_test 6.5 {
+  SELECT zstd_decompress_table('t4');
+  SELECT typeof(data) FROM "_t4_zstd" LIMIT 1;
+} {ok text}
+
+# Disable (should still work after explicit decompress)
+do_execsql_test 6.6 {
   SELECT zstd_disable('t4');
   SELECT data, typeof(data) FROM t4 ORDER BY id;
 } {{First row of data for bulk test} text {Second row of data for bulk test} text}
@@ -283,6 +319,131 @@ do_execsql_test 8.2 {
 
 do_execsql_test 8.3 {
   SELECT zstd_disable('t6');
+} {ok}
+
+#--------------------------------------------------------------------------
+# 9. Dictionary training and usage
+#--------------------------------------------------------------------------
+
+do_execsql_test 9.1 {
+  CREATE TABLE t7(id INTEGER PRIMARY KEY, msg TEXT);
+}
+
+# Insert 200 rows of similar text for dictionary training
+for {set i 1} {$i <= 200} {incr i} {
+  db eval {INSERT INTO t7 VALUES($i, 'The quick brown fox jumps over the lazy dog, message number ' || $i || ' of the training set for zstd dictionary compression.')}
+}
+
+do_execsql_test 9.2 {
+  SELECT count(*) FROM t7;
+} {200}
+
+# Train a dictionary
+do_execsql_test 9.3 {
+  SELECT zstd_train_dict('t7', 'msg', 'test_dict', 32768);
+} {ok}
+
+# Verify dictionary was stored
+do_execsql_test 9.4 {
+  SELECT length(data) > 0, name FROM _zstd_dicts WHERE name='test_dict';
+} {1 test_dict}
+
+# Compress and decompress with dictionary
+do_execsql_test 9.5 {
+  SELECT zstd_decompress(zstd_compress('Test message for dictionary', 'test_dict'), 'test_dict');
+} {{Test message for dictionary}}
+
+do_execsql_test 9.6 {
+  SELECT typeof(zstd_decompress(zstd_compress('Test message', 'test_dict'), 'test_dict'));
+} {text}
+
+# Enable with dictionary config
+do_execsql_test 9.7 {
+  INSERT INTO _zstd_config(tbl, col, dict_name) VALUES('t7', 'msg', 'test_dict');
+  SELECT zstd_enable('t7');
+} {ok}
+
+# Read through view
+do_execsql_test 9.8 {
+  SELECT msg FROM t7 WHERE id=1;
+} {{The quick brown fox jumps over the lazy dog, message number 1 of the training set for zstd dictionary compression.}}
+
+# Insert/update through view with dict compression
+do_execsql_test 9.9 {
+  INSERT INTO t7 VALUES(201, 'New message inserted with dictionary compression');
+  SELECT msg FROM t7 WHERE id=201;
+} {{New message inserted with dictionary compression}}
+
+do_execsql_test 9.10 {
+  UPDATE t7 SET msg='Updated with dictionary' WHERE id=1;
+  SELECT msg FROM t7 WHERE id=1;
+} {{Updated with dictionary}}
+
+do_execsql_test 9.11 {
+  SELECT zstd_disable('t7');
+  SELECT typeof(msg) FROM t7 WHERE id=201;
+} {ok text}
+
+#--------------------------------------------------------------------------
+# 10. Composite primary key
+#--------------------------------------------------------------------------
+
+do_execsql_test 10.1 {
+  CREATE TABLE t8(a TEXT, b TEXT, data TEXT, PRIMARY KEY(a, b));
+  INSERT INTO t8 VALUES('x', '1', 'row x1');
+  INSERT INTO t8 VALUES('x', '2', 'row x2');
+  INSERT INTO t8 VALUES('y', '1', 'row y1');
+  INSERT INTO _zstd_config(tbl, col) VALUES('t8', 'data');
+  SELECT zstd_enable('t8');
+} {ok}
+
+do_execsql_test 10.2 {
+  SELECT a, b, data FROM t8 ORDER BY a, b;
+} {x 1 {row x1} x 2 {row x2} y 1 {row y1}}
+
+do_execsql_test 10.3 {
+  INSERT INTO t8 VALUES('y', '2', 'row y2');
+  SELECT data FROM t8 WHERE a='y' AND b='2';
+} {{row y2}}
+
+do_execsql_test 10.4 {
+  UPDATE t8 SET data='updated x1' WHERE a='x' AND b='1';
+  SELECT data FROM t8 WHERE a='x' AND b='1';
+} {{updated x1}}
+
+do_execsql_test 10.5 {
+  DELETE FROM t8 WHERE a='x' AND b='2';
+  SELECT count(*) FROM t8;
+} {3}
+
+do_execsql_test 10.6 {
+  SELECT zstd_disable('t8');
+  SELECT a, b, data FROM t8 ORDER BY a, b;
+} {ok x 1 {updated x1} y 1 {row y1} y 2 {row y2}}
+
+#--------------------------------------------------------------------------
+# 11. Table with no explicit primary key (uses rowid)
+#--------------------------------------------------------------------------
+
+do_execsql_test 11.1 {
+  CREATE TABLE t9(name TEXT, data TEXT);
+  INSERT INTO t9 VALUES('alice', 'data for alice');
+  INSERT INTO t9 VALUES('bob', 'data for bob');
+  INSERT INTO _zstd_config(tbl, col) VALUES('t9', 'data');
+  SELECT zstd_enable('t9');
+} {ok}
+
+do_execsql_test 11.2 {
+  SELECT name, data FROM t9 ORDER BY name;
+} {alice {data for alice} bob {data for bob}}
+
+do_execsql_test 11.3 {
+  INSERT INTO t9 VALUES('carol', 'data for carol');
+  SELECT data FROM t9 WHERE name='carol';
+} {{data for carol}}
+
+do_execsql_test 11.4 {
+  SELECT zstd_disable('t9');
 } {ok}
 
 finish_test

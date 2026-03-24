@@ -163,6 +163,7 @@ libdir      ?= $(exec_prefix)/lib
 # to use the one(s) it needs.
 #
 LDFLAGS.zlib ?= -lz
+LDFLAGS.zstd ?= -lzstd
 LDFLAGS.math ?= -lm
 LDFLAGS.rpath ?= -Wl,-rpath -Wl,$(prefix)/lib
 LDFLAGS.pthread ?= -lpthread
@@ -453,7 +454,7 @@ T.link.shared = $(T.link) $(LDFLAGS.shlib)
 LDFLAGS.libsqlite3 = \
   $(LDFLAGS.rpath) $(LDFLAGS.pthread) \
   $(LDFLAGS.math) $(LDFLAGS.dlopen) \
-  $(LDFLAGS.zlib) $(LDFLAGS.icu) \
+  $(LDFLAGS.zlib) $(LDFLAGS.zstd) $(LDFLAGS.icu) \
   $(LDFLAGS.rt) $(LDFLAGS.configure)
 
 #
