@@ -861,6 +861,14 @@ static int zstdGetColInfo(
     memset(&aCols[nCols], 0, sizeof(ZstdColInfo));
     aCols[nCols].zName = sqlite3_mprintf("%s", zName);
     aCols[nCols].zType = sqlite3_mprintf("%s", zType ? zType : "");
+    if( aCols[nCols].zName==0 || aCols[nCols].zType==0 ){
+      sqlite3_free(aCols[nCols].zName);
+      sqlite3_free(aCols[nCols].zType);
+      sqlite3_finalize(pStmt);
+      zstdFreeColInfo(aCols, nCols);
+      sqlite3_free(zPkCol);
+      return SQLITE_NOMEM;
+    }
     aCols[nCols].iPk = iPk;
     aCols[nCols].bCompress = 0;
     aCols[nCols].zDict = 0;
@@ -868,10 +876,7 @@ static int zstdGetColInfo(
 
     if( iPk>0 ) nPkCols++;
     /* Track single INTEGER PRIMARY KEY for WHERE clause */
-    if( iPk==1 && zType && (
-        sqlite3_stricmp(zType, "INTEGER")==0 ||
-        sqlite3_stricmp(zType, "INT")==0
-    )){
+    if( iPk==1 && zType && sqlite3_stricmp(zType, "INTEGER")==0 ){
       sqlite3_free(zPkCol);
       zPkCol = sqlite3_mprintf("%s", zName);
     }
@@ -1082,6 +1087,7 @@ static void zstdEnableFunc(
         zOld ? zOld : "", sep, aCols[i].zName, aCols[i].zName);
     }
     sqlite3_free(zOld);
+    if( !zViewCols || !zInsertCols || !zInsertVals || !zUpdateSet ) break;
   }
 
   /* Build WHERE clause for UPDATE/DELETE triggers */
@@ -1223,8 +1229,13 @@ static void zstdDisableFunc(
 
   /* Get column config so we can decompress data before removing the layer */
   rc = zstdGetColInfo(db, zTable, &aCols, &nCols, &zPkCol, &zErr);
+  if( rc!=SQLITE_OK ){
+    sqlite3_result_error(ctx,
+      zErr ? zErr : "could not read column config for decompression", -1);
+    sqlite3_free(zErr);
+    return;
+  }
   sqlite3_free(zErr);
-  zErr = 0;
 
   rc = SQLITE_OK;
   zstdDbExec(&rc, db, "SAVEPOINT zstd_disable");
@@ -1329,19 +1340,21 @@ static void zstdCompressTableFunc(
     if( aCols[i].zDict ){
       zstdDbExec(&rc, db,
         "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_compress(\"%w\", %Q)"
-        " WHERE typeof(\"%w\")!='blob'"
+        " WHERE \"%w\" IS NOT NULL"
+        " AND (typeof(\"%w\")!='blob'"
         " OR length(\"%w\")<3"
-        " OR substr(\"%w\",1,2)!=x'1A5D'",
+        " OR substr(\"%w\",1,2)!=x'1A5D')",
         zTable, aCols[i].zName, aCols[i].zName, aCols[i].zDict,
-        aCols[i].zName, aCols[i].zName, aCols[i].zName);
+        aCols[i].zName, aCols[i].zName, aCols[i].zName, aCols[i].zName);
     }else{
       zstdDbExec(&rc, db,
         "UPDATE \"_%w_zstd\" SET \"%w\"=zstd_compress(\"%w\")"
-        " WHERE typeof(\"%w\")!='blob'"
+        " WHERE \"%w\" IS NOT NULL"
+        " AND (typeof(\"%w\")!='blob'"
         " OR length(\"%w\")<3"
-        " OR substr(\"%w\",1,2)!=x'1A5D'",
+        " OR substr(\"%w\",1,2)!=x'1A5D')",
         zTable, aCols[i].zName, aCols[i].zName,
-        aCols[i].zName, aCols[i].zName, aCols[i].zName);
+        aCols[i].zName, aCols[i].zName, aCols[i].zName, aCols[i].zName);
     }
   }
 

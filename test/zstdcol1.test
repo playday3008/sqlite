@@ -132,7 +132,7 @@ do_execsql_test 3.3 {
   SELECT type, name FROM sqlite_master
   WHERE name IN ('t1', '_t1_zstd')
   ORDER BY name;
-} {_t1_zstd table t1 view}
+} {table _t1_zstd view t1}
 
 # Read through view returns original data
 do_execsql_test 3.4 {
